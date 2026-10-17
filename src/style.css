@@ -1,0 +1,27 @@
+:root{--bg:#2a2a2a;--ink:#fff;--bar:#000;--dim:#9a9a9a;color-scheme:light dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1b1b1b}}
+:root[data-theme="dark"]{--bg:#1b1b1b}
+html,body{height:100%;margin:0;background:var(--bg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink);overflow:hidden}
+#app{height:100%;display:flex;flex-direction:column;width:100%}
+header{background:var(--bar);text-align:center;font:300 34px/60px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.6em;position:relative}
+#best{position:absolute;right:14px;top:0;font:13px/60px system-ui,sans-serif;letter-spacing:0;color:var(--dim)}
+#stage{position:relative;flex:1;min-height:0;cursor:crosshair;touch-action:none}
+canvas{display:block;width:100%;height:100%}
+#lvl{position:absolute;left:18px;top:14px;color:#222;font-size:17px}
+#res{position:absolute;left:0;right:0;top:22%;text-align:center;color:#111;pointer-events:none}
+#res b{font-size:64px;font-weight:300;display:block}
+#res span{font-size:15px;color:#333}
+#nav{position:absolute;left:0;right:0;bottom:10px;display:flex;gap:10px;justify-content:center}
+button{background:rgba(0,0,0,.75);color:#fff;border:0;padding:9px 14px;font-size:13px;border-radius:3px;cursor:pointer}
+button:disabled{color:#777;cursor:default}
+#hud{position:absolute;right:10px;top:50px;width:236px;max-height:calc(100% - 120px);overflow:auto;background:rgba(0,0,0,.76);color:#fff;font-size:12px;padding:10px 12px;border-radius:4px;cursor:default;touch-action:auto}
+#hud.off{display:none}
+#hud h4{margin:0 0 6px;font-size:12px;font-weight:600;letter-spacing:.04em;color:#ccc}
+#hud .row{margin:7px 0}
+#hud .row div{display:flex;justify-content:space-between}
+#hud .row span{font-variant-numeric:tabular-nums;color:#8fd0ff}
+#hud input[type=range]{width:100%;margin:2px 0 0}
+#hud .btns{display:flex;gap:6px;margin-top:8px}
+#hud .btns button{flex:1;padding:6px;font-size:12px;background:#333}
+#ro{margin-top:8px;color:#aaa;font-size:11px}
+footer{background:var(--bar);color:var(--dim);font-size:13px;padding:12px;text-align:center}
