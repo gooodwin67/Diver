@@ -37,9 +37,6 @@ export class DivePhysics {
     this.jumpUntil = 0;
     this.jumpGestureLow = null;
     this.jumpStrength = 0;
-    this.launchLean = 0;
-    this.launchSpinLean = 0;
-    this.jumpGestureStartX = 0;
     this.motorSpeeds = {};
     this.jumping = false;
     this.airTime = 0;
@@ -136,10 +133,6 @@ export class DivePhysics {
     const now = performance.now();
     const supported = this.groundTimer > 0 && !this.jumping && !this.limp && !this.entered;
     if (supported) {
-      // Remember the lean in the crouch, independently of the upward stroke.
-      if (this.jumpGestureLow === null || pointerHeight <= this.jumpGestureLow + .03) {
-        this.jumpGestureStartX = x;
-      }
       this.jumpGestureLow = Math.min(this.jumpGestureLow ?? pointerHeight, pointerHeight);
     } else {
       this.jumpGestureLow = null;
@@ -156,10 +149,6 @@ export class DivePhysics {
           && this.elapsed >= this.jumpUntil) {
         this.jumpUntil = this.elapsed + .2;
         this.jumpStrength = clamp((upwardSpeed - this.settings.jerkThr) / this.settings.jerkRange, .35, 1);
-        this.launchLean = Math.abs(this.jumpGestureStartX) < .12 ? 0 : this.jumpGestureStartX;
-        const sidewaysStroke = x - this.jumpGestureStartX;
-        this.launchSpinLean = Math.abs(sidewaysStroke) >= .1
-          ? clamp(sidewaysStroke * 2.5, -1, 1) : this.launchLean;
         this.jumpGestureLow = null;
         this.landingTime = 0;
       }
@@ -281,54 +270,30 @@ export class DivePhysics {
     if (this.jumping || this.elapsed >= this.jumpUntil) return;
     const strength = 1 - this.lockStrength;
     if (strength < .3) return;
-    let mass = 0, velocityY = 0;
+    let mass = 0, centerX = 0, centerY = 0, velocityY = 0;
     for (const body of Object.values(this.bodies)) {
-      const m = body.getMass();
+      const m = body.getMass(), center = body.getWorldCenter();
       mass += m;
+      centerX += m * center.x;
+      centerY += m * center.y;
       velocityY += m * body.getLinearVelocity().y;
     }
+    centerX /= mass;
+    centerY /= mass;
     if (velocityY / mass < .5) return;
     this.jumping = true;
     this.jumpUntil = 0;
     this.jumpGestureLow = null;
-    // Crouched lean controls travel; the upward stroke independently controls spin.
-    const lean = this.launchLean;
+    const lean = Math.abs(this.mouse.x) < .12 ? 0 : this.mouse.x;
+    const spin = -this.settings.spin * lean * strength;
     const push = (lean > 0 ? this.settings.pushForward : this.settings.pushBackward) * lean * strength;
-    for (const body of Object.values(this.bodies)) {
-      const velocity = body.getLinearVelocity();
-      body.setLinearVelocity(V(velocity.x + push, velocity.y));
-    }
-    this.applyTakeoffSpin(strength);
-  }
-
-  applyTakeoffSpin(strength) {
-    const wantedSpin = -this.settings.spin * this.launchSpinLean * strength;
-    let mass = 0, centerX = 0, centerY = 0, velocityX = 0, velocityY = 0;
-    for (const body of Object.values(this.bodies)) {
-      const m = body.getMass(), center = body.getWorldCenter(), velocity = body.getLinearVelocity();
-      mass += m;
-      centerX += m * center.x; centerY += m * center.y;
-      velocityX += m * velocity.x; velocityY += m * velocity.y;
-    }
-    centerX /= mass; centerY /= mass;
-    velocityX /= mass; velocityY /= mass;
-    let inertia = 0, momentum = 0;
-    for (const body of Object.values(this.bodies)) {
-      const center = body.getWorldCenter(), velocity = body.getLinearVelocity();
-      const x = center.x - centerX, y = center.y - centerY, m = body.getMass();
-      inertia += body.getInertia() + m * (x * x + y * y);
-      momentum += body.getInertia() * body.getAngularVelocity()
-        + m * (x * (velocity.y - velocityY) - y * (velocity.x - velocityX));
-    }
-    // Apply once at takeoff, preserving the independent horizontal launch speed.
-    const change = wantedSpin - momentum / inertia;
     for (const body of Object.values(this.bodies)) {
       const center = body.getWorldCenter(), velocity = body.getLinearVelocity();
       body.setLinearVelocity(V(
-        velocity.x - change * (center.y - centerY),
-        velocity.y + change * (center.x - centerX),
+        velocity.x - spin * (center.y - centerY) + push,
+        velocity.y + spin * (center.x - centerX),
       ));
-      body.setAngularVelocity(body.getAngularVelocity() + change);
+      body.setAngularVelocity(body.getAngularVelocity() + spin);
     }
   }
 
