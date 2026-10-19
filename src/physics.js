@@ -6,6 +6,14 @@ const V = (x, y) => new Vec2(x, y);
 const normalizeAngle = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
 const LANDING_RECOVERY = .5;
 const MIN_ABSORBED_JUMP_HEIGHT = .6;
+// Landing "plant": below SPIN_FREE the feet simply lock; above it a small part of the
+// rotation is carried over as a stumble (SPIN_CARRY), reaching full at SPIN_FULL.
+const LANDING_SPIN_FREE = 3;
+const LANDING_SPIN_FULL = 8;
+const LANDING_SPIN_CARRY = .08;
+const LANDING_MOTOR_FLOOR = .35;
+// A foot flicker shorter than this right after touchdown is not a new flight.
+const LANDING_FLIGHT_GRACE = .15;
 const JUMP_POINTER_HEIGHT = .65;
 const MIN_JUMP_POINTER_TRAVEL = .8;
 
@@ -46,6 +54,8 @@ export class DivePhysics {
     this.airSpinFactor = 1;
     this.airSpinPeakFactor = 1;
     this.straightAirTime = 0;
+    this.landingAllowance = 0;
+    this.footLocked = false;
 
     const cliff = this.world.createBody({ type: 'static' });
     cliff.createFixture(new Chain(cliffOutline(level).map(([x, y]) => V(x, y)), true), {
@@ -145,12 +155,13 @@ export class DivePhysics {
       const upwardSpeed = (pointerHeight - this.lastPointer.height) / seconds;
       const travelled = pointerHeight - (this.jumpGestureLow ?? pointerHeight);
       if (supported && pointerHeight >= JUMP_POINTER_HEIGHT
-          && travelled >= MIN_JUMP_POINTER_TRAVEL && upwardSpeed > this.settings.jerkThr
-          && this.elapsed >= this.jumpUntil) {
+        && travelled >= MIN_JUMP_POINTER_TRAVEL && upwardSpeed > this.settings.jerkThr
+        && this.elapsed >= this.jumpUntil) {
         this.jumpUntil = this.elapsed + .2;
         this.jumpStrength = clamp((upwardSpeed - this.settings.jerkThr) / this.settings.jerkRange, .35, 1);
         this.jumpGestureLow = null;
         this.landingTime = 0;
+        this.releaseFoot();
       }
     }
     this.lastPointer = { x, y, height: pointerHeight, time: now };
@@ -160,7 +171,9 @@ export class DivePhysics {
 
   drive(dt) {
     const K = this.settings, P = this.bodies, J = this.joints;
-    const airborne = this.footContacts === 0 && (this.jumping || this.airTime > .06);
+    // Right after touchdown a bouncing foot contact must not flip us back to the air pose.
+    const settling = this.landingTime > 0 && this.airTime < LANDING_FLIGHT_GRACE;
+    const airborne = this.footContacts === 0 && (this.jumping || this.airTime > .06) && !settling;
     const targets = postureTargets(this.mouse, airborne, K.tuckAmount);
     this.groundTimer = this.footContacts > 0 ? 14 : Math.max(0, this.groundTimer - 1);
     const grounded = !airborne && this.groundTimer > 0;
@@ -177,7 +190,7 @@ export class DivePhysics {
     const strength = launching ? 1 - this.jumpStrength : 1;
     this.lockStrength = strength;
     const recovery = clamp(1 - this.landingTime / LANDING_RECOVERY, 0, 1);
-    const motorStrength = .12 + .88 * recovery * recovery;
+    const motorStrength = LANDING_MOTOR_FLOOR + (1 - LANDING_MOTOR_FLOOR) * recovery * recovery;
     J.ankle.setMaxMotorTorque((grounded ? 300 + K.ankleLock * strength : 1500) * motorStrength);
     J.knee.setMaxMotorTorque(K.kneeTorque * motorStrength);
     J.hip.setMaxMotorTorque(K.hipTorque * motorStrength);
@@ -309,7 +322,7 @@ export class DivePhysics {
 
   updateAirSpin(dt) {
     if (this.footContacts > 0 || this.limp || this.entered || this.landingTime > 0
-        || (!this.jumping && this.airTime <= .06)) {
+      || (!this.jumping && this.airTime <= .06)) {
       this.airSpinFactor = 1;
       this.airSpinPeakFactor = 1;
       this.straightAirTime = 0;
@@ -368,9 +381,69 @@ export class DivePhysics {
     this.airSpinPeakFactor = Math.max(this.airSpinPeakFactor, factor);
   }
 
+  wholeBodySpin() {
+    let mass = 0, centerX = 0, centerY = 0, velocityX = 0, velocityY = 0;
+    for (const body of Object.values(this.bodies)) {
+      const m = body.getMass(), center = body.getWorldCenter(), velocity = body.getLinearVelocity();
+      mass += m;
+      centerX += m * center.x;
+      centerY += m * center.y;
+      velocityX += m * velocity.x;
+      velocityY += m * velocity.y;
+    }
+    centerX /= mass; centerY /= mass;
+    velocityX /= mass; velocityY /= mass;
+    let inertia = 0, momentum = 0;
+    for (const body of Object.values(this.bodies)) {
+      const center = body.getWorldCenter(), velocity = body.getLinearVelocity();
+      const x = center.x - centerX, y = center.y - centerY, m = body.getMass();
+      inertia += body.getInertia() + m * (x * x + y * y);
+      momentum += body.getInertia() * body.getAngularVelocity()
+        + m * (x * (velocity.y - velocityY) - y * (velocity.x - velocityX));
+    }
+    return { velocityX, velocityY, omega: momentum / inertia };
+  }
+
+  // Put the foot flat on the surface (instead of on its toe / "ballet" pose) by turning it
+  // around the ankle, then move the whole body so the sole touches the ground exactly.
+  plantFoot(normal) {
+    const foot = this.bodies.foot, shin = this.bodies.shin;
+    const local = V(-.06, bodyParts.foot.h / 2);
+    const anchor = foot.getWorldPoint(local);
+    const current = foot.getAngle();
+    const groundAngle = Math.atan2(-normal.x, normal.y);
+    const ankle = this.joints.ankle;
+    // ankle angle = shin - foot, so the foot angle has to stay inside these bounds.
+    const low = shin.getAngle() - ankle.getUpperLimit() + .02;
+    const high = shin.getAngle() - ankle.getLowerLimit() - .02;
+    const angle = clamp(current + normalizeAngle(groundAngle - current), low, high);
+    const cos = Math.cos(angle), sin = Math.sin(angle);
+    foot.setTransform(V(anchor.x - (cos * local.x - sin * local.y),
+      anchor.y - (sin * local.x + cos * local.y)), angle);
+    foot.setAngularVelocity(0);
+
+    const sole = foot.getWorldPoint(V(0, -bodyParts.foot.h / 2));
+    let groundY = null;
+    this.world.rayCast(V(sole.x, sole.y + .5), V(sole.x, sole.y - .8), (fixture, point, n, fraction) => {
+      if (fixture.getBody().getUserData() !== 'cliff') return -1;
+      groundY = point.y;
+      return fraction;
+    });
+    if (groundY === null) return;
+    const gap = clamp(sole.y - groundY, -.3, .6);
+    if (Math.abs(gap) < .003) return;
+    for (const body of Object.values(this.bodies)) {
+      const position = body.getPosition();
+      body.setTransform(V(position.x, position.y - gap), body.getAngle());
+    }
+  }
+
   land() {
     const normal = this.landingNormal;
-    const absorbImpact = this.jumpRise > MIN_ABSORBED_JUMP_HEIGHT;
+    const recent = this.landingTime > 0;
+    const { velocityX, velocityY, omega } = this.wholeBodySpin();
+    const spinning = Math.abs(omega) > LANDING_SPIN_FREE;
+    const absorbImpact = this.jumpRise > MIN_ABSORBED_JUMP_HEIGHT || recent || spinning;
     this.jumping = false;
     this.jumpUntil = 0;
     this.jumpGestureLow = null;
@@ -382,21 +455,32 @@ export class DivePhysics {
       // A small hop keeps normal contact physics and full motor response.
       this.landingTime = 0;
       this.landingTargets = null;
+      this.landingAllowance = 0;
       return;
     }
+    this.plantFoot(normal);
+    // Weld the foot's rotation for the recovery: it cannot rock heel-to-toe, flicker
+    // its contact or bounce, so the rest of the body settles on a stable base.
+    this.bodies.foot.setFixedRotation(true);
+    this.footLocked = true;
+
     const tangent = V(normal.y, -normal.x);
-    let mass = 0, tangentMomentum = 0;
+    const heavy = clamp((Math.abs(omega) - LANDING_SPIN_FREE) / (LANDING_SPIN_FULL - LANDING_SPIN_FREE), 0, 1);
+    const tangentSpeed = velocityX * tangent.x + velocityY * tangent.y;
+    const slideLimit = .2 + .3 * heavy;
+    const slide = clamp(tangentSpeed * (.1 + .2 * heavy), -slideLimit, slideLimit);
+    // Only a strong rotation leaves a small carried-over tilt. It is a rigid rotation
+    // around the planted foot, so no joint is excited and the body just rocks a bit.
+    const carry = omega * LANDING_SPIN_CARRY * heavy;
+    this.landingAllowance = Math.min(.8, Math.abs(carry) * 1.8);
+    const pivot = this.bodies.foot.getWorldPoint(V(0, -bodyParts.foot.h / 2));
     for (const body of Object.values(this.bodies)) {
-      const velocity = body.getLinearVelocity(), m = body.getMass();
-      mass += m;
-      tangentMomentum += m * (velocity.x * tangent.x + velocity.y * tangent.y);
-    }
-    // Absorb the normal impact and most sliding energy. Giving every segment the
-    // same residual velocity also removes the relative motion that re-excites joints.
-    const slide = clamp(tangentMomentum / mass * .1, -.2, .2);
-    for (const body of Object.values(this.bodies)) {
-      body.setLinearVelocity(V(tangent.x * slide, tangent.y * slide));
-      body.setAngularVelocity(0);
+      const center = body.getWorldCenter();
+      body.setLinearVelocity(V(
+        tangent.x * slide - carry * (center.y - pivot.y),
+        tangent.y * slide + carry * (center.x - pivot.x),
+      ));
+      body.setAngularVelocity(body === this.bodies.foot ? 0 : carry);
     }
     this.balanceAdjustment = 0;
     this.jerk = 0;
@@ -407,31 +491,40 @@ export class DivePhysics {
     for (const joint of Object.values(this.joints)) joint.setMotorSpeed(0);
   }
 
+  releaseFoot() {
+    if (!this.footLocked) return;
+    this.footLocked = false;
+    this.bodies.foot.setFixedRotation(false);
+    this.bodies.foot.setAngularVelocity(0);
+  }
+
   limitLandingEnergy() {
     if (this.landingTime <= 0 || this.limp || this.entered) return;
     let mass = 0, energy = 0;
     for (const body of Object.values(this.bodies)) {
       const velocity = body.getLinearVelocity(), m = body.getMass();
       mass += m;
-      energy += .5 * m * (velocity.x ** 2 + velocity.y ** 2)
+      // Falling under gravity is not "excess" energy; only count sideways and rotating motion.
+      energy += .5 * m * (velocity.x ** 2 + Math.max(0, velocity.y) ** 2)
         + .5 * body.getInertia() * body.getAngularVelocity() ** 2;
     }
     const recovery = clamp(1 - this.landingTime / LANDING_RECOVERY, 0, 1);
-    const speedLimit = .1 + .35 * recovery;
+    const speedLimit = .1 + .35 * recovery + this.landingAllowance;
     const budget = .5 * mass * speedLimit ** 2;
-    if (energy <= budget) return;
-    const scale = Math.sqrt(budget / energy);
-    // Uniform scaling preserves joint velocity relationships while removing energy.
+    const scale = energy > budget ? Math.sqrt(budget / energy) : 1;
+    const upCap = .25 + .5 * recovery;
     for (const body of Object.values(this.bodies)) {
       const velocity = body.getLinearVelocity();
-      body.setLinearVelocity(V(velocity.x * scale, velocity.y * scale));
-      body.setAngularVelocity(body.getAngularVelocity() * scale);
+      // Never scale the downward part (gravity/contact), and never allow a hop.
+      const vy = velocity.y < 0 ? velocity.y : Math.min(velocity.y * scale, upCap);
+      body.setLinearVelocity(V(velocity.x * scale, vy));
+      if (body !== this.bodies.foot) body.setAngularVelocity(body.getAngularVelocity() * scale);
     }
   }
 
   stabilizeFoot() {
     if (this.limp || this.entered || this.jumping || this.elapsed < this.jumpUntil
-        || this.groundTimer === 0) return;
+      || this.groundTimer === 0) return;
     const foot = this.bodies.foot;
     const center = foot.getPosition();
     const angle = foot.getAngle();
@@ -494,8 +587,8 @@ export class DivePhysics {
     if (previousContacts > 0 && this.footContacts === 0) {
       this.takeoffHeight = supportedHeight;
       this.jumpRise = 0;
-      this.landingTime = 0;
-      this.landingTargets = null;
+      // Landing recovery is NOT cancelled here: a foot that briefly loses contact
+      // right after touchdown would otherwise restore full motor power mid-wobble.
     }
     if (this.takeoffHeight !== null) {
       this.jumpRise = Math.max(this.jumpRise, this.centerOfMassHeight() - this.takeoffHeight);
@@ -512,7 +605,12 @@ export class DivePhysics {
     this.limitLandingEnergy();
     this.stabilizeFoot();
     this.airTime = this.footContacts > 0 ? 0 : this.airTime + dt;
+    if (this.landingTime > 0 && this.airTime > LANDING_FLIGHT_GRACE) {
+      this.landingTime = 0;
+      this.landingTargets = null;
+    }
     this.landingTime = Math.max(0, this.landingTime - dt);
+    if (this.footLocked && (this.landingTime <= 0 || this.limp || this.entered)) this.releaseFoot();
     if (!this.entered) this.evaluateEntry();
     this.updateAirSpin(dt);
     if (!this.done && this.entered && this.bodies.torso.getPosition().y < -2.2) {
